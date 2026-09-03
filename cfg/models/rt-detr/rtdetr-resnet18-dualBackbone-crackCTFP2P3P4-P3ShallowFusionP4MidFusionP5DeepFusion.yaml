@@ -1,0 +1,108 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# RT-DETR-ResNet18 双模态裂纹检测
+# 使用 CrackCFT 在 Backbone 各层交互 + P3/P4/P5 层级融合模块
+#
+# 数据格式: [IR, VIS] = [B, 6, H, W]，前3通道是IR，后3通道是VIS
+# 融合模块输入顺序: [IR, VIS]
+
+# Parameters
+ch: 6
+nc: 80  # number of classes (根据你的数据集修改)
+scales:
+  l: [1.00, 1.00, 1024]
+
+backbone:
+  # [from, repeats, module, args]
+  # ======================== 输入处理 ========================
+  - [-1, 1, IN, []]                                    # 0 - 6通道输入 [IR(3) + VIS(3)]
+  - [-1, 1, Multiin, [1]]                              # 1 - 取前3通道 → IR (红外)
+  - [-2, 1, Multiin, [2]]                              # 2 - 取后3通道 → VIS (可见光)
+
+  # ======================== P1: Stem ========================
+  # IR流 (红外) - 从索引1开始
+  - [1, 1, ConvNormLayer, [32, 3, 2, 1, 'relu']]       # 3 - IR P1
+  - [-1, 1, ConvNormLayer, [32, 3, 1, 1, 'relu']]      # 4
+  - [-1, 1, ConvNormLayer, [64, 3, 1, 1, 'relu']]      # 5
+  - [-1, 1, nn.MaxPool2d, [3, 2, 1]]                   # 6 - IR P2 downsample
+
+  # VIS流 (可见光) - 从索引2开始
+  - [2, 1, ConvNormLayer, [32, 3, 2, 1, 'relu']]       # 7 - VIS P1
+  - [-1, 1, ConvNormLayer, [32, 3, 1, 1, 'relu']]      # 8
+  - [-1, 1, ConvNormLayer, [64, 3, 1, 1, 'relu']]      # 9
+  - [-1, 1, nn.MaxPool2d, [3, 2, 1]]                   # 10 - VIS P2 downsample
+
+  # ======================== P2 + CrackCFT ========================
+  - [6, 2, Blocks, [64, BasicBlock, 2, False]]         # 11 - IR_P2
+  - [10, 2, Blocks, [64, BasicBlock, 2, False]]        # 12 - VIS_P2
+  # CrackCFT输入: [VIS, IR] → 输出: (VIS_out, IR_out)
+  # 注意: CrackCFT内部第一个是VIS，第二个是IR
+  - [[12, 11], 1, CrackCFT_P2, [64]]                   # 13 - CrackCFT_P2 [VIS_P2, IR_P2]
+  - [[12, 13], 1, Add2, [64, 0]]                       # 14 - VIS_P2 + CFT[0] (VIS部分)
+  - [[11, 13], 1, Add2, [64, 1]]                       # 15 - IR_P2 + CFT[1] (IR部分)
+
+  # ======================== P3 + CrackCFT ========================
+  - [15, 2, Blocks, [128, BasicBlock, 3, False]]       # 16 - IR_P3
+  - [14, 2, Blocks, [128, BasicBlock, 3, False]]       # 17 - VIS_P3
+  - [[17, 16], 1, CrackCFT_P3, [128]]                  # 18 - CrackCFT_P3 [VIS_P3, IR_P3]
+  - [[17, 18], 1, Add2, [128, 0]]                      # 19 - VIS_P3'
+  - [[16, 18], 1, Add2, [128, 1]]                      # 20 - IR_P3'
+
+  # ======================== P4 + CrackCFT ========================
+  - [20, 2, Blocks, [256, BasicBlock, 4, False]]       # 21 - IR_P4
+  - [19, 2, Blocks, [256, BasicBlock, 4, False]]       # 22 - VIS_P4
+  - [[22, 21], 1, CrackCFT_P4, [256]]                  # 23 - CrackCFT_P4 [VIS_P4, IR_P4]
+  - [[22, 23], 1, Add2, [256, 0]]                      # 24 - VIS_P4'
+  - [[21, 23], 1, Add2, [256, 1]]                      # 25 - IR_P4'
+
+  # ======================== P5 (无CFT) ========================
+  - [25, 2, Blocks, [512, BasicBlock, 5, False]]       # 26 - IR_P5
+  - [24, 2, Blocks, [512, BasicBlock, 5, False]]       # 27 - VIS_P5
+
+  # ======================== 层级融合模块 ========================
+  # 融合模块输入顺序: [IR, VIS] (红外在前，可见光在后)
+  #
+  # P3ShallowFusion: IR缺浅层裂纹 → VIS补充IR
+  #   输入: [IR_P3'(20), VIS_P3'(19)] → 输出: 256ch
+  #
+  # P4MidFusion: 双向互补
+  #   输入: [IR_P4'(25), VIS_P4'(24)] → 输出: 512ch
+  #
+  # P5DeepFusion: VIS缺深层裂纹 → IR补充VIS
+  #   输入: [IR_P5(26), VIS_P5(27)] → 输出: 1024ch
+
+  - [[20, 19], 1, P3ShallowFusion, [256]]              # 28 - Fused_P3 [IR_P3', VIS_P3']
+  - [[25, 24], 1, P4MidFusion, [512]]                  # 29 - Fused_P4 [IR_P4', VIS_P4']
+  - [[26, 27], 1, P5DeepFusion, [1024]]                # 30 - Fused_P5 [IR_P5, VIS_P5]
+
+head:
+  # ======================== RT-DETR Head ========================
+  # P5 处理
+  - [30, 1, Conv, [256, 1, 1, None, 1, 1, False]]      # 31 - input_proj.2 (1024→256)
+  - [-1, 1, AIFI, [1024, 8]]                           # 32 - AIFI
+  - [-1, 1, Conv, [256, 1, 1]]                         # 33 - Y5, lateral_convs.0
+
+  # FPN: P5 → P4
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]         # 34 - Upsample
+  - [29, 1, Conv, [256, 1, 1, None, 1, 1, False]]      # 35 - input_proj.1 (512→256)
+  - [[-2, -1], 1, Concat, [1]]                         # 36 - Cat(Up(Y5), P4)
+  - [-1, 3, RepC3, [256, 0.5]]                         # 37 - fpn_blocks.0
+  - [-1, 1, Conv, [256, 1, 1]]                         # 38 - Y4, lateral_convs.1
+
+  # FPN: P4 → P3
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]         # 39 - Upsample
+  - [28, 1, Conv, [256, 1, 1, None, 1, 1, False]]      # 40 - input_proj.0 (256→256)
+  - [[-2, -1], 1, Concat, [1]]                         # 41 - Cat(Up(Y4), P3)
+  - [-1, 3, RepC3, [256, 0.5]]                         # 42 - X3, fpn_blocks.1
+
+  # PAN: P3 → P4
+  - [-1, 1, Conv, [256, 3, 2]]                         # 43 - downsample_convs.0
+  - [[-1, 38], 1, Concat, [1]]                         # 44 - Cat(Down(X3), Y4)
+  - [-1, 3, RepC3, [256, 0.5]]                         # 45 - F4, pan_blocks.0
+
+  # PAN: P4 → P5
+  - [-1, 1, Conv, [256, 3, 2]]                         # 46 - downsample_convs.1
+  - [[-1, 33], 1, Concat, [1]]                         # 47 - Cat(Down(F4), Y5)
+  - [-1, 3, RepC3, [256, 0.5]]                         # 48 - F5, pan_blocks.1
+
+  # Decoder
+  - [[42, 45, 48], 1, RTDETRDecoder, [nc, 256, 300, 4, 8, 3]]  # 49 - Detect(P3, P4, P5)

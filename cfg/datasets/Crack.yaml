@@ -1,0 +1,9 @@
+path:
+
+train:
+train_infrared:
+val:
+test:
+# Classes
+names:
+  0: crack
